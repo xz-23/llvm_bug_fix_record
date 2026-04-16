@@ -12,9 +12,9 @@
 
 #include "llvm/Transforms/Scalar/JumpThreading.h"
 #include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
@@ -69,7 +69,6 @@
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/SSAUpdater.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
-#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <iterator>
@@ -106,6 +105,10 @@ static cl::opt<bool> ThreadAcrossLoopHeaders(
     "jump-threading-across-loop-headers",
     cl::desc("Allow JumpThreading to thread across loop headers, for testing"),
     cl::init(false), cl::Hidden);
+
+namespace llvm {
+extern cl::opt<bool> ProfcheckDisableMetadataFixes;
+}
 
 JumpThreadingPass::JumpThreadingPass(int T) {
   DefaultBBDupThreshold = (T == -1) ? BBDuplicateThreshold : unsigned(T);
@@ -147,7 +150,7 @@ JumpThreadingPass::JumpThreadingPass(int T) {
 //  that P(t == true) is also unlikely.
 //
 static void updatePredecessorProfileMetadata(PHINode *PN, BasicBlock *BB) {
-  BranchInst *CondBr = dyn_cast<BranchInst>(BB->getTerminator());
+  CondBrInst *CondBr = dyn_cast<CondBrInst>(BB->getTerminator());
   if (!CondBr)
     return;
 
@@ -170,8 +173,7 @@ static void updatePredecessorProfileMetadata(PHINode *PN, BasicBlock *BB) {
     auto *SuccBB = PhiBB;
     SmallPtrSet<BasicBlock *, 16> Visited;
     while (true) {
-      BranchInst *PredBr = dyn_cast<BranchInst>(PredBB->getTerminator());
-      if (PredBr && PredBr->isConditional())
+      if (isa<CondBrInst>(PredBB->getTerminator()))
         return {PredBB, SuccBB};
       Visited.insert(PredBB);
       auto *SinglePredBB = PredBB->getSinglePredecessor();
@@ -206,7 +208,7 @@ static void updatePredecessorProfileMetadata(PHINode *PN, BasicBlock *BB) {
       return;
 
     BasicBlock *PredBB = PredOutEdge.first;
-    BranchInst *PredBr = dyn_cast<BranchInst>(PredBB->getTerminator());
+    CondBrInst *PredBr = dyn_cast<CondBrInst>(PredBB->getTerminator());
     if (!PredBr)
       return;
 
@@ -231,7 +233,7 @@ static void updatePredecessorProfileMetadata(PHINode *PN, BasicBlock *BB) {
       Weights[0] = BP.getCompl().getNumerator();
       Weights[1] = BP.getNumerator();
     }
-    setBranchWeights(*PredBr, Weights);
+    setBranchWeights(*PredBr, Weights, hasBranchWeightOrigin(*PredBr));
   }
 }
 
@@ -250,7 +252,7 @@ PreservedAnalyses JumpThreadingPass::run(Function &F,
       runImpl(F, &AM, &TLI, &TTI, &LVI, &AA,
               std::make_unique<DomTreeUpdater>(
                   &DT, nullptr, DomTreeUpdater::UpdateStrategy::Lazy),
-              std::nullopt, std::nullopt);
+              nullptr, nullptr);
 
   if (!Changed)
     return PreservedAnalyses::all();
@@ -284,8 +286,8 @@ bool JumpThreadingPass::runImpl(Function &F_, FunctionAnalysisManager *FAM_,
                                 TargetTransformInfo *TTI_, LazyValueInfo *LVI_,
                                 AliasAnalysis *AA_,
                                 std::unique_ptr<DomTreeUpdater> DTU_,
-                                std::optional<BlockFrequencyInfo *> BFI_,
-                                std::optional<BranchProbabilityInfo *> BPI_) {
+                                BlockFrequencyInfo *BFI_,
+                                BranchProbabilityInfo *BPI_) {
   LLVM_DEBUG(dbgs() << "Jump threading on function '" << F_.getName() << "'\n");
   F = &F_;
   FAM = FAM_;
@@ -296,25 +298,24 @@ bool JumpThreadingPass::runImpl(Function &F_, FunctionAnalysisManager *FAM_,
   DTU = std::move(DTU_);
   BFI = BFI_;
   BPI = BPI_;
-  auto *GuardDecl = F->getParent()->getFunction(
-      Intrinsic::getName(Intrinsic::experimental_guard));
+  auto *GuardDecl = Intrinsic::getDeclarationIfExists(
+      F->getParent(), Intrinsic::experimental_guard);
   HasGuards = GuardDecl && !GuardDecl->use_empty();
 
   // Reduce the number of instructions duplicated when optimizing strictly for
   // size.
   if (BBDuplicateThreshold.getNumOccurrences())
     BBDupThreshold = BBDuplicateThreshold;
-  else if (F->hasFnAttribute(Attribute::MinSize))
+  else if (F->hasMinSize())
     BBDupThreshold = 3;
   else
     BBDupThreshold = DefaultBBDupThreshold;
 
-  // JumpThreading must not processes blocks unreachable from entry. It's a
-  // waste of compute time and can potentially lead to hangs.
-  SmallPtrSet<BasicBlock *, 16> Unreachable;
   assert(DTU && "DTU isn't passed into JumpThreading before using it.");
   assert(DTU->hasDomTree() && "JumpThreading relies on DomTree to proceed.");
   DominatorTree &DT = DTU->getDomTree();
+
+  Unreachable.clear();
   for (auto &BB : *F)
     if (!DT.isReachableFromEntry(&BB))
       Unreachable.insert(&BB);
@@ -331,11 +332,6 @@ bool JumpThreadingPass::runImpl(Function &F_, FunctionAnalysisManager *FAM_,
         continue;
       while (processBlock(&BB)) // Thread all of the branches we can over BB.
         Changed = ChangedSinceLastAnalysisUpdate = true;
-
-      // Jump threading may have introduced redundant debug values into BB
-      // which should be removed.
-      if (Changed)
-        RemoveRedundantDbgInstrs(&BB);
 
       // Stop processing BB if it's the entry or is now deleted. The following
       // routines attempt to eliminate BB and locating a suitable replacement
@@ -358,9 +354,8 @@ bool JumpThreadingPass::runImpl(Function &F_, FunctionAnalysisManager *FAM_,
 
       // processBlock doesn't thread BBs with unconditional TIs. However, if BB
       // is "almost empty", we attempt to merge BB with its sole successor.
-      auto *BI = dyn_cast<BranchInst>(BB.getTerminator());
-      if (BI && BI->isUnconditional()) {
-        BasicBlock *Succ = BI->getSuccessor(0);
+      if (auto *BI = dyn_cast<UncondBrInst>(BB.getTerminator())) {
+        BasicBlock *Succ = BI->getSuccessor();
         if (
             // The terminator must be the only non-phi instruction in BB.
             BB.getFirstNonPHIOrDbg(true)->isTerminator() &&
@@ -368,7 +363,6 @@ bool JumpThreadingPass::runImpl(Function &F_, FunctionAnalysisManager *FAM_,
             // detect and transform nested loops later.
             !LoopHeaders.count(&BB) && !LoopHeaders.count(Succ) &&
             TryToSimplifyUncondBranchFromEmptyBlock(&BB, DTU.get())) {
-          RemoveRedundantDbgInstrs(Succ);
           // BB is valid for cleanup here because we passed in DTU. F remains
           // BB's parent until a DTU->getDomTree() event.
           LVI->eraseBlock(&BB);
@@ -378,6 +372,13 @@ bool JumpThreadingPass::runImpl(Function &F_, FunctionAnalysisManager *FAM_,
     }
     EverChanged |= Changed;
   } while (Changed);
+
+  // Jump threading may have introduced redundant debug values into F which
+  // should be removed.
+  if (EverChanged)
+    for (auto &BB : *F) {
+      RemoveRedundantDbgInstrs(&BB);
+    }
 
   LoopHeaders.clear();
   return EverChanged;
@@ -401,8 +402,8 @@ static bool replaceFoldableUses(Instruction *Cond, Value *ToVal,
     Changed |= replaceNonLocalUsesWith(Cond, ToVal);
   for (Instruction &I : reverse(*KnownAtEndOfBB)) {
     // Replace any debug-info record users of Cond with ToVal.
-    for (DPValue &DPV : I.getDbgValueRange())
-      DPV.replaceVariableLocationOp(Cond, ToVal, true);
+    for (DbgVariableRecord &DVR : filterDbgVars(I.getDbgRecordRange()))
+      DVR.replaceVariableLocationOp(Cond, ToVal, true);
 
     // Reached the Cond whose uses we are trying to replace, so there are no
     // more uses.
@@ -526,9 +527,7 @@ static unsigned getJumpThreadDuplicationCost(const TargetTransformInfo *TTI,
 void JumpThreadingPass::findLoopHeaders(Function &F) {
   SmallVector<std::pair<const BasicBlock*,const BasicBlock*>, 32> Edges;
   FindFunctionBackedges(F, Edges);
-
-  for (const auto &Edge : Edges)
-    LoopHeaders.insert(Edge.second);
+  LoopHeaders.insert_range(llvm::make_second_range(Edges));
 }
 
 /// getKnownConstant - Helper method to determine if we can thread over a
@@ -558,9 +557,9 @@ static Constant *getKnownConstant(Value *Val, ConstantPreference Preference) {
 /// This returns true if there were any known values.
 bool JumpThreadingPass::computeValueKnownInPredecessorsImpl(
     Value *V, BasicBlock *BB, PredValueInfo &Result,
-    ConstantPreference Preference, DenseSet<Value *> &RecursionSet,
+    ConstantPreference Preference, SmallPtrSet<Value *, 4> &RecursionSet,
     Instruction *CxtI) {
-  const DataLayout &DL = BB->getModule()->getDataLayout();
+  const DataLayout &DL = BB->getDataLayout();
 
   // This method walks up use-def chains recursively.  Because of this, we could
   // get into an infinite loop going around loops in the use-def chain.  To
@@ -581,7 +580,6 @@ bool JumpThreadingPass::computeValueKnownInPredecessorsImpl(
   // then it can't be derived from a PHI.
   Instruction *I = dyn_cast<Instruction>(V);
   if (!I || I->getParent() != BB) {
-
     // Okay, if this is a live-in value, see if it has a known value at the any
     // edge from our predecessors.
     for (BasicBlock *P : predecessors(BB)) {
@@ -593,14 +591,11 @@ bool JumpThreadingPass::computeValueKnownInPredecessorsImpl(
       // 'getPredicateOnEdge' method. This would be able to handle value
       // inequalities better, for example if the compare is "X < 4" and "X < 3"
       // is known true but "X < 4" itself is not available.
-      CmpInst::Predicate Pred;
+      CmpPredicate Pred;
       Value *Val;
       Constant *Cst;
-      if (!PredCst && match(V, m_Cmp(Pred, m_Value(Val), m_Constant(Cst)))) {
-        auto Res = LVI->getPredicateOnEdge(Pred, Val, Cst, P, BB, CxtI);
-        if (Res != LazyValueInfo::Unknown)
-          PredCst = ConstantInt::getBool(V->getContext(), Res);
-      }
+      if (!PredCst && match(V, m_Cmp(Pred, m_Value(Val), m_Constant(Cst))))
+        PredCst = LVI->getPredicateOnEdge(Pred, Val, Cst, P, BB, CxtI);
       if (Constant *KC = getKnownConstant(PredCst, Preference))
         Result.emplace_back(KC, P);
     }
@@ -757,7 +752,7 @@ bool JumpThreadingPass::computeValueKnownInPredecessorsImpl(
     // may result in comparison of values from two different loop iterations.
     // FIXME: This check is broken if LoopHeaders is not populated.
     if (PN && PN->getParent() == BB && !LoopHeaders.contains(BB)) {
-      const DataLayout &DL = PN->getModule()->getDataLayout();
+      const DataLayout &DL = PN->getDataLayout();
       // We can do this simplification if any comparisons fold to true or false.
       // See if any do.
       for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i) {
@@ -780,13 +775,8 @@ bool JumpThreadingPass::computeValueKnownInPredecessorsImpl(
           if (LHSInst && LHSInst->getParent() == BB)
             continue;
 
-          LazyValueInfo::Tristate
-            ResT = LVI->getPredicateOnEdge(Pred, LHS,
-                                           cast<Constant>(RHS), PredBB, BB,
-                                           CxtI ? CxtI : Cmp);
-          if (ResT == LazyValueInfo::Unknown)
-            continue;
-          Res = ConstantInt::get(Type::getInt1Ty(LHS->getContext()), ResT);
+          Res = LVI->getPredicateOnEdge(Pred, LHS, cast<Constant>(RHS), PredBB,
+                                        BB, CxtI ? CxtI : Cmp);
         }
 
         if (Constant *KC = getKnownConstant(Res, WantInteger))
@@ -806,14 +796,10 @@ bool JumpThreadingPass::computeValueKnownInPredecessorsImpl(
         for (BasicBlock *P : predecessors(BB)) {
           // If the value is known by LazyValueInfo to be a constant in a
           // predecessor, use that information to try to thread this block.
-          LazyValueInfo::Tristate Res =
-            LVI->getPredicateOnEdge(Pred, CmpLHS,
-                                    CmpConst, P, BB, CxtI ? CxtI : Cmp);
-          if (Res == LazyValueInfo::Unknown)
-            continue;
-
-          Constant *ResC = ConstantInt::get(CmpType, Res);
-          Result.emplace_back(ResC, P);
+          Constant *Res = LVI->getPredicateOnEdge(Pred, CmpLHS, CmpConst, P, BB,
+                                                  CxtI ? CxtI : Cmp);
+          if (Constant *KC = getKnownConstant(Res, WantInteger))
+            Result.emplace_back(KC, P);
         }
 
         return !Result.empty();
@@ -868,7 +854,8 @@ bool JumpThreadingPass::computeValueKnownInPredecessorsImpl(
 
       for (const auto &LHSVal : LHSVals) {
         Constant *V = LHSVal.first;
-        Constant *Folded = ConstantExpr::getCompare(Pred, V, CmpConst);
+        Constant *Folded =
+            ConstantFoldCompareInstOperands(Pred, V, CmpConst, DL);
         if (Constant *KC = getKnownConstant(Folded, WantInteger))
           Result.emplace_back(KC, LHSVal.second);
       }
@@ -955,6 +942,155 @@ static bool hasAddressTakenAndUsed(BasicBlock *BB) {
   return !BA->use_empty();
 }
 
+// If BB has exactly one predecessor with a conditional branch to BB, the edge
+// taken into BB determines the branch condition value (true for successor 0,
+// false for successor 1). Materialize that fact by replacing uses in BB.
+static bool propagatePredBranchConditionIntoBlock(BasicBlock *BB,
+                                                  const TargetLibraryInfo *TLI) {
+  BasicBlock *Pred = BB->getSinglePredecessor();
+  if (!Pred || Pred == BB)
+    return false;
+
+  auto *PredBr = dyn_cast<CondBrInst>(Pred->getTerminator());
+  if (!PredBr)
+    return false;
+
+  if (PredBr->getSuccessor(0) == PredBr->getSuccessor(1))
+    return false;
+
+  bool CondVal;
+  if (PredBr->getSuccessor(0) == BB)
+    CondVal = true;
+  else if (PredBr->getSuccessor(1) == BB)
+    CondVal = false;
+  else
+    return false;
+
+  Value *Cond = PredBr->getCondition();
+  auto *CondTy = dyn_cast<IntegerType>(Cond->getType());
+  if (!CondTy || CondTy->getBitWidth() != 1)
+    return false;
+
+  auto getI1Constant = [](Value *V) -> std::optional<bool> {
+    if (auto *CI = dyn_cast<ConstantInt>(V))
+      if (CI->getType()->isIntegerTy(1))
+        return CI->isOne();
+    return std::nullopt;
+  };
+
+  DenseMap<Value *, bool> KnownFacts;
+  SmallVector<std::pair<Value *, bool>, 16> Worklist;
+  Worklist.emplace_back(Cond, CondVal);
+
+  while (!Worklist.empty()) {
+    auto [V, KnownVal] = Worklist.pop_back_val();
+
+    auto It = KnownFacts.find(V);
+    if (It != KnownFacts.end()) {
+      if (It->second != KnownVal)
+        return false;
+      continue;
+    }
+    KnownFacts[V] = KnownVal;
+
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I)
+      continue;
+
+    if (auto *FI = dyn_cast<FreezeInst>(I)) {
+      Worklist.emplace_back(FI->getOperand(0), KnownVal);
+      continue;
+    }
+
+    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+      if (!BO->getType()->isIntegerTy(1))
+        continue;
+
+      if (BO->getOpcode() == Instruction::Or && !KnownVal) {
+        Worklist.emplace_back(BO->getOperand(0), false);
+        Worklist.emplace_back(BO->getOperand(1), false);
+        continue;
+      }
+
+      if (BO->getOpcode() == Instruction::And && KnownVal) {
+        Worklist.emplace_back(BO->getOperand(0), true);
+        Worklist.emplace_back(BO->getOperand(1), true);
+        continue;
+      }
+
+      if (BO->getOpcode() == Instruction::Xor) {
+        if (std::optional<bool> C = getI1Constant(BO->getOperand(1))) {
+          Worklist.emplace_back(BO->getOperand(0), KnownVal ^ *C);
+          continue;
+        }
+        if (std::optional<bool> C = getI1Constant(BO->getOperand(0))) {
+          Worklist.emplace_back(BO->getOperand(1), KnownVal ^ *C);
+          continue;
+        }
+      }
+    }
+
+    if (auto *SI = dyn_cast<SelectInst>(I)) {
+      if (!SI->getType()->isIntegerTy(1))
+        continue;
+
+      Value *SelCond = SI->getCondition();
+      Value *TV = SI->getTrueValue();
+      Value *FV = SI->getFalseValue();
+
+      if (auto CondIt = KnownFacts.find(SelCond); CondIt != KnownFacts.end()) {
+        Worklist.emplace_back(CondIt->second ? TV : FV, KnownVal);
+        continue;
+      }
+
+      std::optional<bool> TC = getI1Constant(TV);
+      std::optional<bool> FC = getI1Constant(FV);
+      if (KnownVal) {
+        if (TC && !*TC) {
+          Worklist.emplace_back(SelCond, false);
+          Worklist.emplace_back(FV, true);
+        } else if (FC && !*FC) {
+          Worklist.emplace_back(SelCond, true);
+          Worklist.emplace_back(TV, true);
+        }
+      } else {
+        if (TC && *TC) {
+          Worklist.emplace_back(SelCond, false);
+          Worklist.emplace_back(FV, false);
+        } else if (FC && *FC) {
+          Worklist.emplace_back(SelCond, true);
+          Worklist.emplace_back(TV, false);
+        }
+      }
+    }
+  }
+
+  SmallVector<std::pair<Use *, Constant *>, 16> UsesToReplace;
+  for (const auto &KV : KnownFacts) {
+    Value *KnownV = KV.first;
+    bool KnownB = KV.second;
+    if (!KnownV->getType()->isIntegerTy(1))
+      continue;
+
+    Constant *KnownC = ConstantInt::get(KnownV->getType(), KnownB);
+    for (Use &U : KnownV->uses()) {
+      auto *UserI = dyn_cast<Instruction>(U.getUser());
+      if (!UserI || UserI->getParent() != BB || isa<PHINode>(UserI))
+        continue;
+      UsesToReplace.emplace_back(&U, KnownC);
+    }
+  }
+
+  if (UsesToReplace.empty())
+    return false;
+
+  for (const auto &P : UsesToReplace)
+    P.first->set(P.second);
+
+  SimplifyInstructionsInBlock(BB, TLI);
+  return true;
+}
+
 /// processBlock - If there are any predecessors whose control can be threaded
 /// through to a successor, transform them now.
 bool JumpThreadingPass::processBlock(BasicBlock *BB) {
@@ -971,6 +1107,9 @@ bool JumpThreadingPass::processBlock(BasicBlock *BB) {
   if (maybeMergeBasicBlockIntoOnlyPred(BB))
     return true;
 
+  if (propagatePredBranchConditionIntoBlock(BB, TLI))
+    return true;
+
   if (tryToUnfoldSelectInCurrBB(BB))
     return true;
 
@@ -985,9 +1124,7 @@ bool JumpThreadingPass::processBlock(BasicBlock *BB) {
   // branch, if not we can't thread it.
   Value *Condition;
   Instruction *Terminator = BB->getTerminator();
-  if (BranchInst *BI = dyn_cast<BranchInst>(Terminator)) {
-    // Can't thread an unconditional jump.
-    if (BI->isUnconditional()) return false;
+  if (CondBrInst *BI = dyn_cast<CondBrInst>(Terminator)) {
     Condition = BI->getCondition();
   } else if (SwitchInst *SI = dyn_cast<SwitchInst>(Terminator)) {
     Condition = SI->getCondition();
@@ -1007,7 +1144,7 @@ bool JumpThreadingPass::processBlock(BasicBlock *BB) {
   // constant.
   if (Instruction *I = dyn_cast<Instruction>(Condition)) {
     Value *SimpleVal =
-        ConstantFoldInstruction(I, BB->getModule()->getDataLayout(), TLI);
+        ConstantFoldInstruction(I, BB->getDataLayout(), TLI);
     if (SimpleVal) {
       I->replaceAllUsesWith(SimpleVal);
       if (isInstructionTriviallyDead(I, TLI))
@@ -1037,7 +1174,9 @@ bool JumpThreadingPass::processBlock(BasicBlock *BB) {
 
     LLVM_DEBUG(dbgs() << "  In block '" << BB->getName()
                       << "' folding undef terminator: " << *BBTerm << '\n');
-    BranchInst::Create(BBTerm->getSuccessor(BestSucc), BBTerm);
+    Instruction *NewBI = UncondBrInst::Create(BBTerm->getSuccessor(BestSucc),
+                                              BBTerm->getIterator());
+    NewBI->setDebugLoc(BBTerm->getDebugLoc());
     ++NumFolds;
     BBTerm->eraseFromParent();
     DTU->applyUpdatesPermissive(Updates);
@@ -1080,11 +1219,11 @@ bool JumpThreadingPass::processBlock(BasicBlock *BB) {
     // it's value at the branch instruction.  We only handle comparisons
     // against a constant at this time.
     if (Constant *CondConst = dyn_cast<Constant>(CondCmp->getOperand(1))) {
-      LazyValueInfo::Tristate Ret =
+      Constant *Res =
           LVI->getPredicateAt(CondCmp->getPredicate(), CondCmp->getOperand(0),
                               CondConst, BB->getTerminator(),
                               /*UseBlockValue=*/false);
-      if (Ret != LazyValueInfo::Unknown) {
+      if (Res) {
         // We can safely replace *some* uses of the CondInst if it has
         // exactly one value as returned by LVI. RAUW is incorrect in the
         // presence of guards and assumes, that have the `Cond` as the use. This
@@ -1092,10 +1231,7 @@ bool JumpThreadingPass::processBlock(BasicBlock *BB) {
         // at the end of block, but RAUW unconditionally replaces all uses
         // including the guards/assumes themselves and the uses before the
         // guard/assume.
-        auto *CI = Ret == LazyValueInfo::True ?
-          ConstantInt::getTrue(CondCmp->getType()) :
-          ConstantInt::getFalse(CondCmp->getType());
-        if (replaceFoldableUses(CondCmp, CI, BB))
+        if (replaceFoldableUses(CondCmp, Res, BB))
           return true;
       }
 
@@ -1128,7 +1264,7 @@ bool JumpThreadingPass::processBlock(BasicBlock *BB) {
 
   // Before threading, try to propagate profile data backwards:
   if (PHINode *PN = dyn_cast<PHINode>(CondInst))
-    if (PN->getParent() == BB && isa<BranchInst>(BB->getTerminator()))
+    if (PN->getParent() == BB && isa<CondBrInst>(BB->getTerminator()))
       updatePredecessorProfileMetadata(PN, BB);
 
   // Handle a variety of cases where we are branching on something derived from
@@ -1140,12 +1276,12 @@ bool JumpThreadingPass::processBlock(BasicBlock *BB) {
   // If this is an otherwise-unfoldable branch on a phi node or freeze(phi) in
   // the current block, see if we can simplify.
   PHINode *PN = dyn_cast<PHINode>(CondWithoutFreeze);
-  if (PN && PN->getParent() == BB && isa<BranchInst>(BB->getTerminator()))
+  if (PN && PN->getParent() == BB && isa<CondBrInst>(BB->getTerminator()))
     return processBranchOnPHI(PN);
 
   // If this is an otherwise-unfoldable branch on a XOR, see if we can simplify.
   if (CondInst->getOpcode() == Instruction::Xor &&
-      CondInst->getParent() == BB && isa<BranchInst>(BB->getTerminator()))
+      CondInst->getParent() == BB && isa<CondBrInst>(BB->getTerminator()))
     return processBranchOnXOR(cast<BinaryOperator>(CondInst));
 
   // Search for a stronger dominating condition that can be used to simplify a
@@ -1157,8 +1293,8 @@ bool JumpThreadingPass::processBlock(BasicBlock *BB) {
 }
 
 bool JumpThreadingPass::processImpliedCondition(BasicBlock *BB) {
-  auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
-  if (!BI || !BI->isConditional())
+  auto *BI = dyn_cast<CondBrInst>(BB->getTerminator());
+  if (!BI)
     return false;
 
   Value *Cond = BI->getCondition();
@@ -1177,11 +1313,11 @@ bool JumpThreadingPass::processImpliedCondition(BasicBlock *BB) {
   BasicBlock *CurrentPred = BB->getSinglePredecessor();
   unsigned Iter = 0;
 
-  auto &DL = BB->getModule()->getDataLayout();
+  auto &DL = BB->getDataLayout();
 
   while (CurrentPred && Iter++ < ImplicationSearchThreshold) {
-    auto *PBI = dyn_cast<BranchInst>(CurrentPred->getTerminator());
-    if (!PBI || !PBI->isConditional())
+    auto *PBI = dyn_cast<CondBrInst>(CurrentPred->getTerminator());
+    if (!PBI)
       return false;
     if (PBI->getSuccessor(0) != CurrentBB && PBI->getSuccessor(1) != CurrentBB)
       return false;
@@ -1202,7 +1338,8 @@ bool JumpThreadingPass::processImpliedCondition(BasicBlock *BB) {
       BasicBlock *KeepSucc = BI->getSuccessor(*Implication ? 0 : 1);
       BasicBlock *RemoveSucc = BI->getSuccessor(*Implication ? 1 : 0);
       RemoveSucc->removePredecessor(BB);
-      BranchInst *UncondBI = BranchInst::Create(KeepSucc, BI);
+      UncondBrInst *UncondBI =
+          UncondBrInst::Create(KeepSucc, BI->getIterator());
       UncondBI->setDebugLoc(BI->getDebugLoc());
       ++NumFolds;
       BI->eraseFromParent();
@@ -1278,9 +1415,11 @@ bool JumpThreadingPass::simplifyPartiallyRedundantLoad(LoadInst *LoadI) {
     // only happen in dead loops.
     if (AvailableVal == LoadI)
       AvailableVal = PoisonValue::get(LoadI->getType());
-    if (AvailableVal->getType() != LoadI->getType())
+    if (AvailableVal->getType() != LoadI->getType()) {
       AvailableVal = CastInst::CreateBitOrPointerCast(
-          AvailableVal, LoadI->getType(), "", LoadI);
+          AvailableVal, LoadI->getType(), "", LoadI->getIterator());
+      cast<Instruction>(AvailableVal)->setDebugLoc(LoadI->getDebugLoc());
+    }
     LoadI->replaceAllUsesWith(AvailableVal);
     LoadI->eraseFromParent();
     return true;
@@ -1321,7 +1460,7 @@ bool JumpThreadingPass::simplifyPartiallyRedundantLoad(LoadInst *LoadI) {
     // If this is a load on a phi pointer, phi-translate it and search
     // for available load/store to the pointer in predecessors.
     Type *AccessTy = LoadI->getType();
-    const auto &DL = LoadI->getModule()->getDataLayout();
+    const auto &DL = LoadI->getDataLayout();
     MemoryLocation Loc(LoadedPtr->DoPHITranslation(LoadBB, PredBB),
                        LocationSize::precise(DL.getTypeStoreSize(AccessTy)),
                        AATags);
@@ -1392,10 +1531,8 @@ bool JumpThreadingPass::simplifyPartiallyRedundantLoad(LoadInst *LoadI) {
     // Otherwise, we had multiple unavailable predecessors or we had a critical
     // edge from the one.
     SmallVector<BasicBlock*, 8> PredsToSplit;
-    SmallPtrSet<BasicBlock*, 8> AvailablePredSet;
-
-    for (const auto &AvailablePred : AvailablePreds)
-      AvailablePredSet.insert(AvailablePred.first);
+    SmallPtrSet<BasicBlock *, 8> AvailablePredSet(
+        llvm::from_range, llvm::make_first_range(AvailablePreds));
 
     // Add all the unavailable predecessors to the PredsToSplit list.
     for (BasicBlock *P : predecessors(LoadBB)) {
@@ -1421,7 +1558,7 @@ bool JumpThreadingPass::simplifyPartiallyRedundantLoad(LoadInst *LoadI) {
         LoadI->getType(), LoadedPtr->DoPHITranslation(LoadBB, UnavailablePred),
         LoadI->getName() + ".pr", false, LoadI->getAlign(),
         LoadI->getOrdering(), LoadI->getSyncScopeID(),
-        UnavailablePred->getTerminator());
+        UnavailablePred->getTerminator()->getIterator());
     NewVal->setDebugLoc(LoadI->getDebugLoc());
     if (AATags)
       NewVal->setAAMetadata(AATags);
@@ -1434,16 +1571,14 @@ bool JumpThreadingPass::simplifyPartiallyRedundantLoad(LoadInst *LoadI) {
   array_pod_sort(AvailablePreds.begin(), AvailablePreds.end());
 
   // Create a PHI node at the start of the block for the PRE'd load value.
-  pred_iterator PB = pred_begin(LoadBB), PE = pred_end(LoadBB);
-  PHINode *PN = PHINode::Create(LoadI->getType(), std::distance(PB, PE), "");
+  PHINode *PN = PHINode::Create(LoadI->getType(), pred_size(LoadBB), "");
   PN->insertBefore(LoadBB->begin());
   PN->takeName(LoadI);
   PN->setDebugLoc(LoadI->getDebugLoc());
 
   // Insert new entries into the PHI for each predecessor.  A single block may
   // have multiple entries here.
-  for (pred_iterator PI = PB; PI != PE; ++PI) {
-    BasicBlock *P = *PI;
+  for (BasicBlock *P : predecessors(LoadBB)) {
     AvailablePredsTy::iterator I =
         llvm::lower_bound(AvailablePreds, std::make_pair(P, (Value *)nullptr));
 
@@ -1455,9 +1590,18 @@ bool JumpThreadingPass::simplifyPartiallyRedundantLoad(LoadInst *LoadI) {
     // AvailablePreds vector as we go so that all of the PHI entries for this
     // predecessor use the same bitcast.
     Value *&PredV = I->second;
-    if (PredV->getType() != LoadI->getType())
-      PredV = CastInst::CreateBitOrPointerCast(PredV, LoadI->getType(), "",
-                                               P->getTerminator());
+    if (PredV->getType() != LoadI->getType()) {
+      PredV = CastInst::CreateBitOrPointerCast(
+          PredV, LoadI->getType(), "", P->getTerminator()->getIterator());
+      // The new cast is producing the value used to replace the load
+      // instruction, so uses the load's debug location. If P does not always
+      // branch to the load BB however then the debug location must be dropped,
+      // as it is hoisted past a conditional branch.
+      DebugLoc DL = P->getTerminator()->getNumSuccessors() == 1
+                        ? LoadI->getDebugLoc()
+                        : DebugLoc::getDropped();
+      cast<CastInst>(PredV)->setDebugLoc(DL);
+    }
 
     PN->addIncoming(PredV, I->first);
   }
@@ -1490,7 +1634,7 @@ findMostPopularDest(BasicBlock *BB,
 
   // Populate DestPopularity with the successors in the order they appear in the
   // successor list.  This way, we ensure determinism by iterating it in the
-  // same order in std::max_element below.  We map nullptr to 0 so that we can
+  // same order in llvm::max_element below.  We map nullptr to 0 so that we can
   // return nullptr when PredToDestList contains nullptr only.
   DestPopularity[nullptr] = 0;
   for (auto *SuccBB : successors(BB))
@@ -1501,8 +1645,7 @@ findMostPopularDest(BasicBlock *BB,
       DestPopularity[PredToDest.second]++;
 
   // Find the most popular dest.
-  auto MostPopular = std::max_element(
-      DestPopularity.begin(), DestPopularity.end(), llvm::less_second());
+  auto MostPopular = llvm::max_element(DestPopularity, llvm::less_second());
 
   // Okay, we have finally picked the most popular destination.
   return MostPopular->first;
@@ -1512,7 +1655,19 @@ findMostPopularDest(BasicBlock *BB,
 // BB->getSinglePredecessor() and then on to BB.
 Constant *JumpThreadingPass::evaluateOnPredecessorEdge(BasicBlock *BB,
                                                        BasicBlock *PredPredBB,
-                                                       Value *V) {
+                                                       Value *V,
+                                                       const DataLayout &DL) {
+  SmallPtrSet<Value *, 8> Visited;
+  return evaluateOnPredecessorEdge(BB, PredPredBB, V, DL, Visited);
+}
+
+Constant *JumpThreadingPass::evaluateOnPredecessorEdge(
+    BasicBlock *BB, BasicBlock *PredPredBB, Value *V, const DataLayout &DL,
+    SmallPtrSet<Value *, 8> &Visited) {
+  if (!Visited.insert(V).second)
+    return nullptr;
+  llvm::scope_exit _([&Visited, V]() { Visited.erase(V); });
+
   BasicBlock *PredBB = BB->getSinglePredecessor();
   assert(PredBB && "Expected a single predecessor");
 
@@ -1534,14 +1689,19 @@ Constant *JumpThreadingPass::evaluateOnPredecessorEdge(BasicBlock *BB,
   }
 
   // If we have a CmpInst, try to fold it for each incoming edge into PredBB.
+  // Note that during the execution of the pass, phi nodes may become constant
+  // and may be removed, which can lead to self-referencing instructions in
+  // code that becomes unreachable. Consequently, we need to handle those
+  // instructions in unreachable code and check before going into recursion.
   if (CmpInst *CondCmp = dyn_cast<CmpInst>(V)) {
     if (CondCmp->getParent() == BB) {
-      Constant *Op0 =
-          evaluateOnPredecessorEdge(BB, PredPredBB, CondCmp->getOperand(0));
-      Constant *Op1 =
-          evaluateOnPredecessorEdge(BB, PredPredBB, CondCmp->getOperand(1));
+      Constant *Op0 = evaluateOnPredecessorEdge(
+          BB, PredPredBB, CondCmp->getOperand(0), DL, Visited);
+      Constant *Op1 = evaluateOnPredecessorEdge(
+          BB, PredPredBB, CondCmp->getOperand(1), DL, Visited);
       if (Op0 && Op1) {
-        return ConstantExpr::getCompare(CondCmp->getPredicate(), Op0, Op1);
+        return ConstantFoldCompareInstOperands(CondCmp->getPredicate(), Op0,
+                                               Op1, DL);
       }
     }
     return nullptr;
@@ -1598,7 +1758,7 @@ bool JumpThreadingPass::processThreadableEdges(Value *Cond, BasicBlock *BB,
     BasicBlock *DestBB;
     if (isa<UndefValue>(Val))
       DestBB = nullptr;
-    else if (BranchInst *BI = dyn_cast<BranchInst>(BB->getTerminator())) {
+    else if (CondBrInst *BI = dyn_cast<CondBrInst>(BB->getTerminator())) {
       assert(isa<ConstantInt>(Val) && "Expecting a constant integer");
       DestBB = BI->getSuccessor(cast<ConstantInt>(Val)->isZero());
     } else if (SwitchInst *SI = dyn_cast<SwitchInst>(BB->getTerminator())) {
@@ -1655,7 +1815,8 @@ bool JumpThreadingPass::processThreadableEdges(Value *Cond, BasicBlock *BB,
 
       // Finally update the terminator.
       Instruction *Term = BB->getTerminator();
-      BranchInst::Create(OnlyDest, Term);
+      Instruction *NewBI = UncondBrInst::Create(OnlyDest, Term->getIterator());
+      NewBI->setDebugLoc(Term->getDebugLoc());
       ++NumFolds;
       Term->eraseFromParent();
       DTU->applyUpdatesPermissive(Updates);
@@ -1747,13 +1908,12 @@ bool JumpThreadingPass::processBranchOnPHI(PHINode *PN) {
   // to br(icmp(freeze ...)).
   for (unsigned i = 0, e = PN->getNumIncomingValues(); i != e; ++i) {
     BasicBlock *PredBB = PN->getIncomingBlock(i);
-    if (BranchInst *PredBr = dyn_cast<BranchInst>(PredBB->getTerminator()))
-      if (PredBr->isUnconditional()) {
-        PredBBs[0] = PredBB;
-        // Try to duplicate BB into PredBB.
-        if (duplicateCondBranchOnPHIIntoPred(BB, PredBBs))
-          return true;
-      }
+    if (isa<UncondBrInst>(PredBB->getTerminator())) {
+      PredBBs[0] = PredBB;
+      // Try to duplicate BB into PredBB.
+      if (duplicateCondBranchOnPHIIntoPred(BB, PredBBs))
+        return true;
+    }
   }
 
   return false;
@@ -1879,7 +2039,7 @@ bool JumpThreadingPass::processBranchOnXOR(BinaryOperator *BO) {
 static void addPHINodeEntriesForMappedBlock(BasicBlock *PHIBB,
                                             BasicBlock *OldPred,
                                             BasicBlock *NewPred,
-                                     DenseMap<Instruction*, Value*> &ValueMap) {
+                                            ValueToValueMapTy &ValueMap) {
   for (PHINode &PN : PHIBB->phis()) {
     // Ok, we have a PHI node.  Figure out what the incoming value was for the
     // DestBlock.
@@ -1887,7 +2047,7 @@ static void addPHINodeEntriesForMappedBlock(BasicBlock *PHIBB,
 
     // Remap the value if necessary.
     if (Instruction *Inst = dyn_cast<Instruction>(IV)) {
-      DenseMap<Instruction*, Value*>::iterator I = ValueMap.find(Inst);
+      ValueToValueMapTy::iterator I = ValueMap.find(Inst);
       if (I != ValueMap.end())
         IV = I->second;
     }
@@ -1905,6 +2065,18 @@ bool JumpThreadingPass::maybeMergeBasicBlockIntoOnlyPred(BasicBlock *BB) {
   const Instruction *TI = SinglePred->getTerminator();
   if (TI->isSpecialTerminator() || TI->getNumSuccessors() != 1 ||
       SinglePred == BB || hasAddressTakenAndUsed(BB))
+    return false;
+
+  // MergeBasicBlockIntoOnlyPred may delete SinglePred, we need to avoid
+  // deleting a BB pointer from Unreachable.
+  if (Unreachable.count(SinglePred))
+    return false;
+
+  // Don't merge if both the basic block and the predecessor contain loop or
+  // entry convergent intrinsics, since there may only be one convergence token
+  // per block.
+  if (HasLoopOrEntryConvergenceToken(BB) &&
+      HasLoopOrEntryConvergenceToken(SinglePred))
     return false;
 
   // If SinglePred was a loop header, BB becomes one.
@@ -1948,17 +2120,15 @@ bool JumpThreadingPass::maybeMergeBasicBlockIntoOnlyPred(BasicBlock *BB) {
 
 /// Update the SSA form.  NewBB contains instructions that are copied from BB.
 /// ValueMapping maps old values in BB to new ones in NewBB.
-void JumpThreadingPass::updateSSA(
-    BasicBlock *BB, BasicBlock *NewBB,
-    DenseMap<Instruction *, Value *> &ValueMapping) {
+void JumpThreadingPass::updateSSA(BasicBlock *BB, BasicBlock *NewBB,
+                                  ValueToValueMapTy &ValueMapping) {
   // If there were values defined in BB that are used outside the block, then we
   // now have to update all uses of the value to use either the original value,
   // the cloned value, or some PHI derived value.  This can require arbitrary
   // PHI insertion, of which we are prepared to do, clean these up now.
   SSAUpdater SSAUpdate;
   SmallVector<Use *, 16> UsesToRename;
-  SmallVector<DbgValueInst *, 4> DbgValues;
-  SmallVector<DPValue *, 4> DPValues;
+  SmallVector<DbgVariableRecord *, 4> DbgVariableRecords;
 
   for (Instruction &I : *BB) {
     // Scan all uses of this instruction to see if it is used outside of its
@@ -1975,16 +2145,13 @@ void JumpThreadingPass::updateSSA(
     }
 
     // Find debug values outside of the block
-    findDbgValues(DbgValues, &I, &DPValues);
-    llvm::erase_if(DbgValues, [&](const DbgValueInst *DbgVal) {
-      return DbgVal->getParent() == BB;
-    });
-    llvm::erase_if(DPValues, [&](const DPValue *DPVal) {
-      return DPVal->getParent() == BB;
+    findDbgValues(&I, DbgVariableRecords);
+    llvm::erase_if(DbgVariableRecords, [&](const DbgVariableRecord *DbgVarRec) {
+      return DbgVarRec->getParent() == BB;
     });
 
     // If there are no uses outside the block, we're done with this instruction.
-    if (UsesToRename.empty() && DbgValues.empty() && DPValues.empty())
+    if (UsesToRename.empty() && DbgVariableRecords.empty())
       continue;
     LLVM_DEBUG(dbgs() << "JT: Renaming non-local uses of: " << I << "\n");
 
@@ -1997,58 +2164,40 @@ void JumpThreadingPass::updateSSA(
 
     while (!UsesToRename.empty())
       SSAUpdate.RewriteUse(*UsesToRename.pop_back_val());
-    if (!DbgValues.empty() || !DPValues.empty()) {
-      SSAUpdate.UpdateDebugValues(&I, DbgValues);
-      SSAUpdate.UpdateDebugValues(&I, DPValues);
-      DbgValues.clear();
-      DPValues.clear();
+    if (!DbgVariableRecords.empty()) {
+      SSAUpdate.UpdateDebugValues(&I, DbgVariableRecords);
+      DbgVariableRecords.clear();
     }
 
     LLVM_DEBUG(dbgs() << "\n");
   }
 }
 
+static void remapSourceAtoms(ValueToValueMapTy &VM, BasicBlock::iterator Begin,
+                             BasicBlock::iterator End) {
+  if (VM.AtomMap.empty())
+    return;
+  for (auto It = Begin; It != End; ++It)
+    RemapSourceAtom(&*It, VM);
+}
+
 /// Clone instructions in range [BI, BE) to NewBB.  For PHI nodes, we only clone
 /// arguments that come from PredBB.  Return the map from the variables in the
 /// source basic block to the variables in the newly created basic block.
-DenseMap<Instruction *, Value *>
-JumpThreadingPass::cloneInstructions(BasicBlock::iterator BI,
-                                     BasicBlock::iterator BE, BasicBlock *NewBB,
-                                     BasicBlock *PredBB) {
+
+void JumpThreadingPass::cloneInstructions(ValueToValueMapTy &ValueMapping,
+                                          BasicBlock::iterator BI,
+                                          BasicBlock::iterator BE,
+                                          BasicBlock *NewBB,
+                                          BasicBlock *PredBB) {
   // We are going to have to map operands from the source basic block to the new
   // copy of the block 'NewBB'.  If there are PHI nodes in the source basic
   // block, evaluate them to account for entry from PredBB.
-  DenseMap<Instruction *, Value *> ValueMapping;
 
-  // Retargets llvm.dbg.value to any renamed variables.
-  auto RetargetDbgValueIfPossible = [&](Instruction *NewInst) -> bool {
-    auto DbgInstruction = dyn_cast<DbgValueInst>(NewInst);
-    if (!DbgInstruction)
-      return false;
-
+  // Retargets dbg.value to any renamed variables.
+  auto RetargetDbgVariableRecordIfPossible = [&](DbgVariableRecord *DVR) {
     SmallSet<std::pair<Value *, Value *>, 16> OperandsToRemap;
-    for (auto DbgOperand : DbgInstruction->location_ops()) {
-      auto DbgOperandInstruction = dyn_cast<Instruction>(DbgOperand);
-      if (!DbgOperandInstruction)
-        continue;
-
-      auto I = ValueMapping.find(DbgOperandInstruction);
-      if (I != ValueMapping.end()) {
-        OperandsToRemap.insert(
-            std::pair<Value *, Value *>(DbgOperand, I->second));
-      }
-    }
-
-    for (auto &[OldOp, MappedOp] : OperandsToRemap)
-      DbgInstruction->replaceVariableLocationOp(OldOp, MappedOp);
-    return true;
-  };
-
-  // Duplicate implementation of the above dbg.value code, using DPValues
-  // instead.
-  auto RetargetDPValueIfPossible = [&](DPValue *DPV) {
-    SmallSet<std::pair<Value *, Value *>, 16> OperandsToRemap;
-    for (auto *Op : DPV->location_ops()) {
+    for (auto *Op : DVR->location_ops()) {
       Instruction *OpInst = dyn_cast<Instruction>(Op);
       if (!OpInst)
         continue;
@@ -2059,7 +2208,7 @@ JumpThreadingPass::cloneInstructions(BasicBlock::iterator BI,
     }
 
     for (auto &[OldOp, MappedOp] : OperandsToRemap)
-      DPV->replaceVariableLocationOp(OldOp, MappedOp);
+      DVR->replaceVariableLocationOp(OldOp, MappedOp);
   };
 
   BasicBlock *RangeBB = BI->getParent();
@@ -2071,6 +2220,8 @@ JumpThreadingPass::cloneInstructions(BasicBlock::iterator BI,
     PHINode *NewPN = PHINode::Create(PN->getType(), 1, PN->getName(), NewBB);
     NewPN->addIncoming(PN->getIncomingValueForBlock(PredBB), PredBB);
     ValueMapping[PN] = NewPN;
+    if (const DebugLoc &DL = PN->getDebugLoc())
+      mapAtomInstance(DL, ValueMapping);
   }
 
   // Clone noalias scope declarations in the threaded block. When threading a
@@ -2083,9 +2234,9 @@ JumpThreadingPass::cloneInstructions(BasicBlock::iterator BI,
   cloneNoAliasScopes(NoAliasScopes, ClonedScopes, "thread", Context);
 
   auto CloneAndRemapDbgInfo = [&](Instruction *NewInst, Instruction *From) {
-    auto DPVRange = NewInst->cloneDebugInfoFrom(From);
-    for (DPValue &DPV : DPVRange)
-      RetargetDPValueIfPossible(&DPV);
+    auto DVRRange = NewInst->cloneDebugInfoFrom(From);
+    for (DbgVariableRecord &DVR : filterDbgVars(DVRRange))
+      RetargetDbgVariableRecordIfPossible(&DVR);
   };
 
   // Clone the non-phi instructions of the source basic block into NewBB,
@@ -2099,31 +2250,28 @@ JumpThreadingPass::cloneInstructions(BasicBlock::iterator BI,
     adaptNoAliasScopes(New, ClonedScopes, Context);
 
     CloneAndRemapDbgInfo(New, &*BI);
-
-    if (RetargetDbgValueIfPossible(New))
-      continue;
+    if (const DebugLoc &DL = New->getDebugLoc())
+      mapAtomInstance(DL, ValueMapping);
 
     // Remap operands to patch up intra-block references.
     for (unsigned i = 0, e = New->getNumOperands(); i != e; ++i)
       if (Instruction *Inst = dyn_cast<Instruction>(New->getOperand(i))) {
-        DenseMap<Instruction *, Value *>::iterator I = ValueMapping.find(Inst);
+        ValueToValueMapTy::iterator I = ValueMapping.find(Inst);
         if (I != ValueMapping.end())
           New->setOperand(i, I->second);
       }
   }
 
-  // There may be DPValues on the terminator, clone directly from marker
-  // to marker as there isn't an instruction there.
-  if (BE != RangeBB->end() && BE->hasDbgValues()) {
+  // There may be DbgVariableRecords on the terminator, clone directly from
+  // marker to marker as there isn't an instruction there.
+  if (BE != RangeBB->end() && BE->hasDbgRecords()) {
     // Dump them at the end.
-    DPMarker *Marker = RangeBB->getMarker(BE);
-    DPMarker *EndMarker = NewBB->createMarker(NewBB->end());
-    auto DPVRange = EndMarker->cloneDebugInfoFrom(Marker, std::nullopt);
-    for (DPValue &DPV : DPVRange)
-      RetargetDPValueIfPossible(&DPV);
+    DbgMarker *Marker = RangeBB->getMarker(BE);
+    DbgMarker *EndMarker = NewBB->createMarker(NewBB->end());
+    auto DVRRange = EndMarker->cloneDebugInfoFrom(Marker, std::nullopt);
+    for (DbgVariableRecord &DVR : filterDbgVars(DVRRange))
+      RetargetDbgVariableRecordIfPossible(&DVR);
   }
-
-  return ValueMapping;
 }
 
 /// Attempt to thread through two successive basic blocks.
@@ -2146,7 +2294,7 @@ bool JumpThreadingPass::maybethreadThroughTwoBasicBlocks(BasicBlock *BB,
   // PredBB.  Then we can thread edges PredBB1->BB and PredBB2->BB through BB.
 
   // Require that BB end with a Branch for simplicity.
-  BranchInst *CondBr = dyn_cast<BranchInst>(BB->getTerminator());
+  CondBrInst *CondBr = dyn_cast<CondBrInst>(BB->getTerminator());
   if (!CondBr)
     return false;
 
@@ -2158,8 +2306,8 @@ bool JumpThreadingPass::maybethreadThroughTwoBasicBlocks(BasicBlock *BB,
   // Require that PredBB end with a conditional Branch. If PredBB ends with an
   // unconditional branch, we should be merging PredBB and BB instead. For
   // simplicity, we don't deal with a switch.
-  BranchInst *PredBBBranch = dyn_cast<BranchInst>(PredBB->getTerminator());
-  if (!PredBBBranch || PredBBBranch->isUnconditional())
+  CondBrInst *PredBBBranch = dyn_cast<CondBrInst>(PredBB->getTerminator());
+  if (!PredBBBranch)
     return false;
 
   // If PredBB has exactly one incoming edge, we don't gain anything by copying
@@ -2194,12 +2342,13 @@ bool JumpThreadingPass::maybethreadThroughTwoBasicBlocks(BasicBlock *BB,
   unsigned OneCount = 0;
   BasicBlock *ZeroPred = nullptr;
   BasicBlock *OnePred = nullptr;
+  const DataLayout &DL = BB->getDataLayout();
   for (BasicBlock *P : predecessors(PredBB)) {
     // If PredPred ends with IndirectBrInst, we can't handle it.
     if (isa<IndirectBrInst>(P->getTerminator()))
       continue;
     if (ConstantInt *CI = dyn_cast_or_null<ConstantInt>(
-            evaluateOnPredecessorEdge(BB, P, Cond))) {
+            evaluateOnPredecessorEdge(BB, P, Cond, DL))) {
       if (CI->isZero()) {
         ZeroCount++;
         ZeroPred = P;
@@ -2279,8 +2428,8 @@ void JumpThreadingPass::threadThroughTwoBasicBlocks(BasicBlock *PredPredBB,
   auto *BFI = getOrCreateBFI(HasProfile);
   auto *BPI = getOrCreateBPI(BFI != nullptr);
 
-  BranchInst *CondBr = cast<BranchInst>(BB->getTerminator());
-  BranchInst *PredBBBranch = cast<BranchInst>(PredBB->getTerminator());
+  CondBrInst *CondBr = cast<CondBrInst>(BB->getTerminator());
+  CondBrInst *PredBBBranch = cast<CondBrInst>(PredBB->getTerminator());
 
   BasicBlock *NewBB =
       BasicBlock::Create(PredBB->getContext(), PredBB->getName() + ".thread",
@@ -2298,8 +2447,9 @@ void JumpThreadingPass::threadThroughTwoBasicBlocks(BasicBlock *PredPredBB,
   // We are going to have to map operands from the original BB block to the new
   // copy of the block 'NewBB'.  If there are PHI nodes in PredBB, evaluate them
   // to account for entry from PredPredBB.
-  DenseMap<Instruction *, Value *> ValueMapping =
-      cloneInstructions(PredBB->begin(), PredBB->end(), NewBB, PredPredBB);
+  ValueToValueMapTy ValueMapping;
+  cloneInstructions(ValueMapping, PredBB->begin(), PredBB->end(), NewBB,
+                    PredPredBB);
 
   // Copy the edge probabilities from PredBB to NewBB.
   if (BPI)
@@ -2326,6 +2476,9 @@ void JumpThreadingPass::threadThroughTwoBasicBlocks(BasicBlock *PredPredBB,
        {DominatorTree::Insert, PredPredBB, NewBB},
        {DominatorTree::Delete, PredPredBB, PredBB}});
 
+  // Remap source location atoms beacuse we're duplicating control flow.
+  remapSourceAtoms(ValueMapping, NewBB->begin(), NewBB->end());
+
   updateSSA(PredBB, NewBB, ValueMapping);
 
   // Clean up things like PHI nodes with single operands, dead instructions,
@@ -2342,6 +2495,21 @@ void JumpThreadingPass::threadThroughTwoBasicBlocks(BasicBlock *PredPredBB,
 bool JumpThreadingPass::tryThreadEdge(
     BasicBlock *BB, const SmallVectorImpl<BasicBlock *> &PredBBs,
     BasicBlock *SuccBB) {
+  // If multiple predecessors are provided, try threading them individually
+  // (one-by-one). This conservatively creates separate cloned blocks for
+  // each predecessor, which preserves path-specific facts and allows LVI to
+  // discover constants per-edge. If any single-pred threading succeeds,
+  // report success.
+  if (PredBBs.size() > 1) {
+    bool Any = false;
+    for (BasicBlock *P : PredBBs) {
+      SmallVector<BasicBlock *, 1> Single;
+      Single.push_back(P);
+      if (tryThreadEdge(BB, Single, SuccBB))
+        Any = true;
+    }
+    return Any;
+  }
   // If threading to the same block as we come from, we would infinite loop.
   if (SuccBB == BB) {
     LLVM_DEBUG(dbgs() << "  Not threading across BB '" << BB->getName()
@@ -2392,6 +2560,9 @@ void JumpThreadingPass::threadEdge(BasicBlock *BB,
   auto *BPI = getOrCreateBPI(BFI != nullptr);
 
   // And finally, do it!  Start by factoring the predecessors if needed.
+  // Remember original preds for path-sensitive queries.
+  SmallVector<BasicBlock *, 8> OrigPreds(PredBBs.begin(), PredBBs.end());
+
   BasicBlock *PredBB;
   if (PredBBs.size() == 1)
     PredBB = PredBBs[0];
@@ -2422,12 +2593,134 @@ void JumpThreadingPass::threadEdge(BasicBlock *BB,
   }
 
   // Copy all the instructions from BB to NewBB except the terminator.
-  DenseMap<Instruction *, Value *> ValueMapping =
-      cloneInstructions(BB->begin(), std::prev(BB->end()), NewBB, PredBB);
+  ValueToValueMapTy ValueMapping;
+  cloneInstructions(ValueMapping, BB->begin(), std::prev(BB->end()), NewBB,
+                    PredBB);
+
+  // Try to fold live-in values that are known to be constant on the edge
+  // (PredBB -> BB) into constants inside the cloned block NewBB. This makes
+  // path-sensitive facts explicit in the IR and allows later passes (e.g.
+  // InstCombine/ConstantPropagation) to simplify uses (like stores) to
+  // constant values. Only do simple, type-matching replacements restricted
+  // to uses inside NewBB to avoid changing semantics elsewhere.
+  for (ValueToValueMapTy::const_iterator I = ValueMapping.begin(),
+       E = ValueMapping.end(); I != E; ++I) {
+    const Value *OrigV = I->first;
+    Value *MappedV = I->second;
+    if (!MappedV)
+      continue;
+
+    // We only consider values that are live-ins to BB (i.e. not defined in BB)
+    // since values defined in BB have already been cloned and will be
+    // simplified via existing mechanisms.
+    if (const Instruction *Inst = dyn_cast<Instruction>(OrigV)) {
+      if (Inst->getParent() == BB)
+        continue;
+    }
+
+    // Use the more powerful computeValueKnownInPredecessors to determine
+    // whether OrigV has a known constant on each incoming edge (Pred -> BB)
+    // for the original predecessors in PredBBs. Only replace when every
+    // original predecessor provides the same constant.
+    PredValueInfoTy PredVals;
+    if (!computeValueKnownInPredecessors(const_cast<Value *>(OrigV), BB,
+                       PredVals, WantInteger,
+                       BB->getTerminator()))
+      continue;
+
+    Constant *C = nullptr;
+    bool AllAgree = true;
+    for (BasicBlock *OrigPred : PredBBs) {
+      // Find the entry for this predecessor.
+      Constant *CPred = nullptr;
+      for (auto &PV : PredVals)
+        if (PV.second == OrigPred) {
+          CPred = PV.first;
+          break;
+        }
+      if (!CPred) { AllAgree = false; break; }
+      if (!C)
+        C = CPred;
+      else if (C != CPred) { AllAgree = false; break; }
+    }
+    if (!AllAgree || !C)
+      continue;
+
+    // Only replace when the constant type matches the mapped value type.
+    if (C->getType() != MappedV->getType())
+      continue;
+
+    // Replace uses of the mapped value that occur only inside NewBB.
+    SmallVector<Use *, 8> UsesToReplace;
+    for (Use &U : MappedV->uses()) {
+      if (Instruction *UserI = dyn_cast<Instruction>(U.getUser())) {
+        if (UserI->getParent() == NewBB)
+          UsesToReplace.push_back(&U);
+      }
+    }
+    for (Use *U : UsesToReplace)
+      U->set(C);
+  }
+
+  // If we didn't find constants via LVI-based methods, do a conservative
+  // backward walk from PredBB up to a small depth to see if some ancestor
+  // conditional branch directly tests a boolean value that we can use to
+  // replace mapped uses inside NewBB. This handles simple control-dependant
+  // facts like "br i1 %x, T, F" where along edge the value of %x is known.
+  const unsigned MaxBacktrackDepth = 6;
+  for (ValueToValueMapTy::const_iterator I = ValueMapping.begin(),
+       E = ValueMapping.end(); I != E; ++I) {
+    const Value *OrigV = I->first;
+    Value *MappedV = I->second;
+    if (!MappedV || !OrigV)
+      continue;
+    // Only consider i1 typed values for this simple heuristic.
+    if (!OrigV->getType()->isIntegerTy(1))
+      continue;
+
+    // Walk predecessors starting from PredBB and look for a condbr that
+    // directly uses OrigV.
+    BasicBlock *ScanBB = PredBB;
+    unsigned Depth = 0;
+    ConstantInt *FoundC = nullptr;
+    while (ScanBB && Depth++ < MaxBacktrackDepth) {
+      // Look at single predecessor chain; if multiple preds, stop.
+      BasicBlock *Prev = ScanBB->getSinglePredecessor();
+      if (!Prev) break;
+      if (auto *CB = dyn_cast<CondBrInst>(Prev->getTerminator())) {
+        Value *Cond = CB->getCondition();
+        if (Cond == OrigV) {
+          // Determine which successor corresponds to ScanBB.
+          unsigned SuccIdx = (CB->getSuccessor(0) == ScanBB) ? 0 : 1;
+          // If successor 0 corresponds, condition==true on that edge.
+          FoundC = ConstantInt::get(IntegerType::get(OrigV->getContext(), 1),
+                                    SuccIdx == 0);
+          break;
+        }
+      }
+      ScanBB = Prev;
+    }
+
+    if (!FoundC)
+      continue;
+
+    // Replace uses of MappedV only inside NewBB with FoundC.
+    SmallVector<Use *, 8> UsesToReplace2;
+    for (Use &U : MappedV->uses()) {
+      if (Instruction *UserI = dyn_cast<Instruction>(U.getUser())) {
+        if (UserI->getParent() == NewBB)
+          UsesToReplace2.push_back(&U);
+      }
+    }
+    if (UsesToReplace2.empty())
+      continue;
+    for (Use *U : UsesToReplace2)
+      U->set(FoundC);
+  }
 
   // We didn't copy the terminator from BB over to NewBB, because there is now
   // an unconditional jump to SuccBB.  Insert the unconditional jump.
-  BranchInst *NewBI = BranchInst::Create(SuccBB, NewBB);
+  UncondBrInst *NewBI = UncondBrInst::Create(SuccBB, NewBB);
   NewBI->setDebugLoc(BB->getTerminator()->getDebugLoc());
 
   // Check to see if SuccBB has PHI nodes. If so, we need to add entries to the
@@ -2449,6 +2742,7 @@ void JumpThreadingPass::threadEdge(BasicBlock *BB,
                                {DominatorTree::Insert, PredBB, NewBB},
                                {DominatorTree::Delete, PredBB, BB}});
 
+  remapSourceAtoms(ValueMapping, NewBB->begin(), NewBB->end());
   updateSSA(BB, NewBB, ValueMapping);
 
   // At this point, the IR is fully up to date and consistent.  Do a quick scan
@@ -2541,22 +2835,20 @@ void JumpThreadingPass::updateBlockFreqAndEdgeWeight(BasicBlock *PredBB,
   // frequency of BB.
   auto BBOrigFreq = BFI->getBlockFreq(BB);
   auto NewBBFreq = BFI->getBlockFreq(NewBB);
-  auto BB2SuccBBFreq = BBOrigFreq * BPI->getEdgeProbability(BB, SuccBB);
   auto BBNewFreq = BBOrigFreq - NewBBFreq;
   BFI->setBlockFreq(BB, BBNewFreq);
 
   // Collect updated outgoing edges' frequencies from BB and use them to update
   // edge probabilities.
   SmallVector<uint64_t, 4> BBSuccFreq;
-  for (BasicBlock *Succ : successors(BB)) {
-    auto SuccFreq = (Succ == SuccBB)
-                        ? BB2SuccBBFreq - NewBBFreq
-                        : BBOrigFreq * BPI->getEdgeProbability(BB, Succ);
+  for (auto It : enumerate(successors(BB))) {
+    auto BB2SuccBBFreq = BBOrigFreq * BPI->getEdgeProbability(BB, It.index());
+    auto SuccFreq =
+        (It.value() == SuccBB) ? BB2SuccBBFreq - NewBBFreq : BB2SuccBBFreq;
     BBSuccFreq.push_back(SuccFreq.getFrequency());
   }
 
-  uint64_t MaxBBSuccFreq =
-      *std::max_element(BBSuccFreq.begin(), BBSuccFreq.end());
+  uint64_t MaxBBSuccFreq = *llvm::max_element(BBSuccFreq);
 
   SmallVector<BranchProbability, 4> BBSuccProbs;
   if (MaxBBSuccFreq == 0)
@@ -2614,7 +2906,7 @@ void JumpThreadingPass::updateBlockFreqAndEdgeWeight(BasicBlock *PredBB,
       Weights.push_back(Prob.getNumerator());
 
     auto TI = BB->getTerminator();
-    setBranchWeights(*TI, Weights);
+    setBranchWeights(*TI, Weights, hasBranchWeightOrigin(*TI));
   }
 }
 
@@ -2666,20 +2958,23 @@ bool JumpThreadingPass::duplicateCondBranchOnPHIIntoPred(
 
   // Unless PredBB ends with an unconditional branch, split the edge so that we
   // can just clone the bits from BB into the end of the new PredBB.
-  BranchInst *OldPredBranch = dyn_cast<BranchInst>(PredBB->getTerminator());
+  UncondBrInst *OldPredBranch = dyn_cast<UncondBrInst>(PredBB->getTerminator());
 
-  if (!OldPredBranch || !OldPredBranch->isUnconditional()) {
+  if (!OldPredBranch) {
     BasicBlock *OldPredBB = PredBB;
     PredBB = SplitEdge(OldPredBB, BB);
     Updates.push_back({DominatorTree::Insert, OldPredBB, PredBB});
     Updates.push_back({DominatorTree::Insert, PredBB, BB});
     Updates.push_back({DominatorTree::Delete, OldPredBB, BB});
-    OldPredBranch = cast<BranchInst>(PredBB->getTerminator());
+    OldPredBranch = cast<UncondBrInst>(PredBB->getTerminator());
   }
 
   // We are going to have to map operands from the original BB block into the
   // PredBB block.  Evaluate PHI nodes in BB.
-  DenseMap<Instruction*, Value*> ValueMapping;
+  ValueToValueMapTy ValueMapping;
+
+  // Remember the position before the inserted instructions.
+  auto RItBeforeInsertPt = std::next(OldPredBranch->getReverseIterator());
 
   BasicBlock::iterator BI = BB->begin();
   for (; PHINode *PN = dyn_cast<PHINode>(BI); ++BI)
@@ -2693,17 +2988,22 @@ bool JumpThreadingPass::duplicateCondBranchOnPHIIntoPred(
     // Remap operands to patch up intra-block references.
     for (unsigned i = 0, e = New->getNumOperands(); i != e; ++i)
       if (Instruction *Inst = dyn_cast<Instruction>(New->getOperand(i))) {
-        DenseMap<Instruction*, Value*>::iterator I = ValueMapping.find(Inst);
+        ValueToValueMapTy::iterator I = ValueMapping.find(Inst);
         if (I != ValueMapping.end())
           New->setOperand(i, I->second);
       }
+
+    // Remap debug variable operands.
+    remapDebugVariable(ValueMapping, New);
+    if (const DebugLoc &DL = New->getDebugLoc())
+      mapAtomInstance(DL, ValueMapping);
 
     // If this instruction can be simplified after the operands are updated,
     // just use the simplified value instead.  This frequently happens due to
     // phi translation.
     if (Value *IV = simplifyInstruction(
             New,
-            {BB->getModule()->getDataLayout(), TLI, nullptr, nullptr, New})) {
+            {BB->getDataLayout(), TLI, nullptr, nullptr, New})) {
       ValueMapping[&*BI] = IV;
       if (!New->mayHaveSideEffects()) {
         New->eraseFromParent();
@@ -2729,11 +3029,15 @@ bool JumpThreadingPass::duplicateCondBranchOnPHIIntoPred(
 
   // Check to see if the targets of the branch had PHI nodes. If so, we need to
   // add entries to the PHI nodes for branch from PredBB now.
-  BranchInst *BBBranch = cast<BranchInst>(BB->getTerminator());
+  CondBrInst *BBBranch = cast<CondBrInst>(BB->getTerminator());
   addPHINodeEntriesForMappedBlock(BBBranch->getSuccessor(0), BB, PredBB,
                                   ValueMapping);
   addPHINodeEntriesForMappedBlock(BBBranch->getSuccessor(1), BB, PredBB,
                                   ValueMapping);
+
+  // KeyInstructions: Remap the cloned instructions' atoms only.
+  remapSourceAtoms(ValueMapping, std::prev(RItBeforeInsertPt)->getIterator(),
+                   OldPredBranch->getIterator());
 
   updateSSA(BB, PredBB, ValueMapping);
 
@@ -2754,7 +3058,7 @@ bool JumpThreadingPass::duplicateCondBranchOnPHIIntoPred(
 // Pred is a predecessor of BB with an unconditional branch to BB. SI is
 // a Select instruction in Pred. BB has other predecessors and SI is used in
 // a PHI node in BB. SI has no other use.
-// A new basic block, NewBB, is created and SI is converted to compare and 
+// A new basic block, NewBB, is created and SI is converted to compare and
 // conditional branch. SI is erased from parent.
 void JumpThreadingPass::unfoldSelectInstr(BasicBlock *Pred, BasicBlock *BB,
                                           SelectInst *SI, PHINode *SIUse,
@@ -2768,14 +3072,14 @@ void JumpThreadingPass::unfoldSelectInstr(BasicBlock *Pred, BasicBlock *BB,
   //  |-----
   //  v
   // BB
-  BranchInst *PredTerm = cast<BranchInst>(Pred->getTerminator());
+  UncondBrInst *PredTerm = cast<UncondBrInst>(Pred->getTerminator());
   BasicBlock *NewBB = BasicBlock::Create(BB->getContext(), "select.unfold",
                                          BB->getParent(), BB);
   // Move the unconditional branch to NewBB.
   PredTerm->removeFromParent();
   PredTerm->insertInto(NewBB, NewBB->end());
   // Create a conditional branch and update PHI nodes.
-  auto *BI = BranchInst::Create(NewBB, BB, SI->getCondition(), Pred);
+  auto *BI = CondBrInst::Create(SI->getCondition(), NewBB, BB, Pred);
   BI->applyMergedLocation(PredTerm->getDebugLoc(), SI->getDebugLoc());
   BI->copyMetadata(*SI, {LLVMContext::MD_prof});
   SIUse->setIncomingValue(Idx, SI->getFalseValue());
@@ -2835,8 +3139,8 @@ bool JumpThreadingPass::tryToUnfoldSelect(SwitchInst *SI, BasicBlock *BB) {
     if (!PredSI || PredSI->getParent() != Pred || !PredSI->hasOneUse())
       continue;
 
-    BranchInst *PredTerm = dyn_cast<BranchInst>(Pred->getTerminator());
-    if (!PredTerm || !PredTerm->isUnconditional())
+    UncondBrInst *PredTerm = dyn_cast<UncondBrInst>(Pred->getTerminator());
+    if (!PredTerm)
       continue;
 
     unfoldSelectInstr(Pred, BB, PredSI, CondPHI, I);
@@ -2858,12 +3162,11 @@ bool JumpThreadingPass::tryToUnfoldSelect(SwitchInst *SI, BasicBlock *BB) {
 /// And expand the select into a branch structure if one of its arms allows %c
 /// to be folded. This later enables threading from bb1 over bb2.
 bool JumpThreadingPass::tryToUnfoldSelect(CmpInst *CondCmp, BasicBlock *BB) {
-  BranchInst *CondBr = dyn_cast<BranchInst>(BB->getTerminator());
+  CondBrInst *CondBr = dyn_cast<CondBrInst>(BB->getTerminator());
   PHINode *CondLHS = dyn_cast<PHINode>(CondCmp->getOperand(0));
   Constant *CondRHS = cast<Constant>(CondCmp->getOperand(1));
 
-  if (!CondBr || !CondBr->isConditional() || !CondLHS ||
-      CondLHS->getParent() != BB)
+  if (!CondBr || !CondLHS || CondLHS->getParent() != BB)
     return false;
 
   for (unsigned I = 0, E = CondLHS->getNumIncomingValues(); I != E; ++I) {
@@ -2875,22 +3178,20 @@ bool JumpThreadingPass::tryToUnfoldSelect(CmpInst *CondCmp, BasicBlock *BB) {
     if (!SI || SI->getParent() != Pred || !SI->hasOneUse())
       continue;
 
-    BranchInst *PredTerm = dyn_cast<BranchInst>(Pred->getTerminator());
-    if (!PredTerm || !PredTerm->isUnconditional())
+    UncondBrInst *PredTerm = dyn_cast<UncondBrInst>(Pred->getTerminator());
+    if (!PredTerm)
       continue;
 
     // Now check if one of the select values would allow us to constant fold the
     // terminator in BB. We don't do the transform if both sides fold, those
     // cases will be threaded in any case.
-    LazyValueInfo::Tristate LHSFolds =
+    Constant *LHSRes =
         LVI->getPredicateOnEdge(CondCmp->getPredicate(), SI->getOperand(1),
                                 CondRHS, Pred, BB, CondCmp);
-    LazyValueInfo::Tristate RHSFolds =
+    Constant *RHSRes =
         LVI->getPredicateOnEdge(CondCmp->getPredicate(), SI->getOperand(2),
                                 CondRHS, Pred, BB, CondCmp);
-    if ((LHSFolds != LazyValueInfo::Unknown ||
-         RHSFolds != LazyValueInfo::Unknown) &&
-        LHSFolds != RHSFolds) {
+    if ((LHSRes || RHSRes) && LHSRes != RHSRes) {
       unfoldSelectInstr(Pred, BB, SI, CondLHS, I);
       return true;
     }
@@ -2972,17 +3273,47 @@ bool JumpThreadingPass::tryToUnfoldSelectInCurrBB(BasicBlock *BB) {
       continue;
     // Expand the select.
     Value *Cond = SI->getCondition();
-    if (!isGuaranteedNotToBeUndefOrPoison(Cond, nullptr, SI))
-      Cond = new FreezeInst(Cond, "cond.fr", SI);
+    if (!isGuaranteedNotToBeUndefOrPoison(Cond, nullptr, SI)) {
+      Cond = new FreezeInst(Cond, "cond.fr", SI->getIterator());
+      cast<FreezeInst>(Cond)->setDebugLoc(DebugLoc::getTemporary());
+    }
     MDNode *BranchWeights = getBranchWeightMDNode(*SI);
     Instruction *Term =
         SplitBlockAndInsertIfThen(Cond, SI, false, BranchWeights);
     BasicBlock *SplitBB = SI->getParent();
     BasicBlock *NewBB = Term->getParent();
-    PHINode *NewPN = PHINode::Create(SI->getType(), 2, "", SI);
+    PHINode *NewPN = PHINode::Create(SI->getType(), 2, "", SI->getIterator());
     NewPN->addIncoming(SI->getTrueValue(), Term->getParent());
     NewPN->addIncoming(SI->getFalseValue(), BB);
+    NewPN->setDebugLoc(SI->getDebugLoc());
     SI->replaceAllUsesWith(NewPN);
+
+    auto *BPI = getBPI();
+    auto *BFI = getBFI();
+    if (!ProfcheckDisableMetadataFixes && BranchWeights) {
+      SmallVector<uint32_t, 2> BW;
+      [[maybe_unused]] bool Extracted = extractBranchWeights(BranchWeights, BW);
+      assert(Extracted);
+      uint64_t Denominator =
+          sum_of(llvm::map_range(BW, StaticCastTo<uint64_t>));
+      assert(Denominator > 0 &&
+             "At least one of the branch probabilities should be non-zero");
+      BranchProbability TrueProb =
+          BranchProbability::getBranchProbability(BW[0], Denominator);
+      BranchProbability FalseProb =
+          BranchProbability::getBranchProbability(BW[1], Denominator);
+      SmallVector<BranchProbability, 2> BP = {TrueProb, FalseProb};
+
+      if (BPI)
+        BPI->setEdgeProbability(BB, BP);
+
+      if (BFI) {
+        auto BBOrigFreq = BFI->getBlockFreq(BB);
+        auto NewBBFreq = BBOrigFreq * TrueProb;
+        BFI->setBlockFreq(NewBB, NewBBFreq);
+        BFI->setBlockFreq(SplitBB, BBOrigFreq);
+      }
+    }
     SI->eraseFromParent();
     // NewBB and SplitBB are newly created blocks which require insertion.
     std::vector<DominatorTree::UpdateType> Updates;
@@ -3043,7 +3374,7 @@ bool JumpThreadingPass::processGuards(BasicBlock *BB) {
   if (!Parent || Parent != Pred2->getSinglePredecessor())
     return false;
 
-  if (auto *BI = dyn_cast<BranchInst>(Parent->getTerminator()))
+  if (auto *BI = dyn_cast<CondBrInst>(Parent->getTerminator()))
     for (auto &I : *BB)
       if (isGuard(&I) && threadGuard(BB, cast<IntrinsicInst>(&I), BI))
         return true;
@@ -3055,15 +3386,13 @@ bool JumpThreadingPass::processGuards(BasicBlock *BB) {
 /// to one of its branches, in case if diamond's condition implies guard's
 /// condition.
 bool JumpThreadingPass::threadGuard(BasicBlock *BB, IntrinsicInst *Guard,
-                                    BranchInst *BI) {
-  assert(BI->getNumSuccessors() == 2 && "Wrong number of successors?");
-  assert(BI->isConditional() && "Unconditional branch has 2 successors?");
+                                    CondBrInst *BI) {
   Value *GuardCond = Guard->getArgOperand(0);
   Value *BranchCond = BI->getCondition();
   BasicBlock *TrueDest = BI->getSuccessor(0);
   BasicBlock *FalseDest = BI->getSuccessor(1);
 
-  auto &DL = BB->getModule()->getDataLayout();
+  auto &DL = BB->getDataLayout();
   bool TrueDestIsSafe = false;
   bool FalseDestIsSafe = false;
 
@@ -3119,10 +3448,11 @@ bool JumpThreadingPass::threadGuard(BasicBlock *BB, IntrinsicInst *Guard,
       PHINode *NewPN = PHINode::Create(Inst->getType(), 2);
       NewPN->addIncoming(UnguardedMapping[Inst], UnguardedBlock);
       NewPN->addIncoming(GuardedMapping[Inst], GuardedBlock);
+      NewPN->setDebugLoc(Inst->getDebugLoc());
       NewPN->insertBefore(InsertionPoint);
       Inst->replaceAllUsesWith(NewPN);
     }
-    Inst->dropDbgValues();
+    Inst->dropDbgRecords();
     Inst->eraseFromParent();
   }
   return true;
@@ -3182,7 +3512,7 @@ BranchProbabilityInfo *JumpThreadingPass::getBPI() {
     assert(FAM && "Can't create BPI without FunctionAnalysisManager");
     BPI = FAM->getCachedResult<BranchProbabilityAnalysis>(*F);
   }
-  return *BPI;
+  return BPI;
 }
 
 BlockFrequencyInfo *JumpThreadingPass::getBFI() {
@@ -3190,7 +3520,7 @@ BlockFrequencyInfo *JumpThreadingPass::getBFI() {
     assert(FAM && "Can't create BFI without FunctionAnalysisManager");
     BFI = FAM->getCachedResult<BlockFrequencyAnalysis>(*F);
   }
-  return *BFI;
+  return BFI;
 }
 
 // Important note on validity of BPI/BFI. JumpThreading tries to preserve
@@ -3204,7 +3534,7 @@ BranchProbabilityInfo *JumpThreadingPass::getOrCreateBPI(bool Force) {
   if (Force)
     BPI = runExternalAnalysis<BranchProbabilityAnalysis>();
 
-  return *BPI;
+  return BPI;
 }
 
 BlockFrequencyInfo *JumpThreadingPass::getOrCreateBFI(bool Force) {
@@ -3215,5 +3545,5 @@ BlockFrequencyInfo *JumpThreadingPass::getOrCreateBFI(bool Force) {
   if (Force)
     BFI = runExternalAnalysis<BlockFrequencyAnalysis>();
 
-  return *BFI;
+  return BFI;
 }
