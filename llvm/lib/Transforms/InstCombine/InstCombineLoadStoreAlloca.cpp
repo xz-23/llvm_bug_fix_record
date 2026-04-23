@@ -1353,6 +1353,141 @@ static bool equivalentAddressValues(Value *A, Value *B) {
   return false;
 }
 
+static bool getI1Constant(Value *V, bool &C) {
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    if (CI->getType()->isIntegerTy(1)) {
+      C = CI->isOne();
+      return true;
+    }
+  }
+  return false;
+}
+
+// Infer i1 facts from a unique predecessor branch edge into BB.
+// Returns false if Query cannot be proven on that edge.
+static bool getKnownI1OnSinglePredEdge(BasicBlock *BB, Value *Query,
+                                       bool &KnownQuery) {
+  BasicBlock *Pred = BB->getSinglePredecessor();
+  if (!Pred || Pred == BB)
+    return false;
+
+  auto *PredBr = dyn_cast<BranchInst>(Pred->getTerminator());
+  if (!PredBr || !PredBr->isConditional())
+    return false;
+
+  if (PredBr->getSuccessor(0) == PredBr->getSuccessor(1))
+    return false;
+
+  bool CondVal;
+  if (PredBr->getSuccessor(0) == BB)
+    CondVal = true;
+  else if (PredBr->getSuccessor(1) == BB)
+    CondVal = false;
+  else
+    return false;
+
+  Value *Cond = PredBr->getCondition();
+  if (!Cond->getType()->isIntegerTy(1) || !Query->getType()->isIntegerTy(1))
+    return false;
+
+  DenseMap<Value *, bool> KnownFacts;
+  SmallVector<std::pair<Value *, bool>, 16> Worklist;
+  Worklist.emplace_back(Cond, CondVal);
+
+  while (!Worklist.empty()) {
+    auto [V, KnownVal] = Worklist.pop_back_val();
+
+    auto It = KnownFacts.find(V);
+    if (It != KnownFacts.end()) {
+      if (It->second != KnownVal)
+        return false;
+      continue;
+    }
+    KnownFacts[V] = KnownVal;
+
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I)
+      continue;
+
+    if (auto *FI = dyn_cast<FreezeInst>(I)) {
+      Worklist.emplace_back(FI->getOperand(0), KnownVal);
+      continue;
+    }
+
+    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+      if (!BO->getType()->isIntegerTy(1))
+        continue;
+
+      if (BO->getOpcode() == Instruction::Or && !KnownVal) {
+        Worklist.emplace_back(BO->getOperand(0), false);
+        Worklist.emplace_back(BO->getOperand(1), false);
+        continue;
+      }
+
+      if (BO->getOpcode() == Instruction::And && KnownVal) {
+        Worklist.emplace_back(BO->getOperand(0), true);
+        Worklist.emplace_back(BO->getOperand(1), true);
+        continue;
+      }
+
+      if (BO->getOpcode() == Instruction::Xor) {
+        bool C;
+        if (getI1Constant(BO->getOperand(1), C)) {
+          Worklist.emplace_back(BO->getOperand(0), KnownVal ^ C);
+          continue;
+        }
+        if (getI1Constant(BO->getOperand(0), C)) {
+          Worklist.emplace_back(BO->getOperand(1), KnownVal ^ C);
+          continue;
+        }
+      }
+    }
+
+    if (auto *SI = dyn_cast<SelectInst>(I)) {
+      if (!SI->getType()->isIntegerTy(1))
+        continue;
+
+      Value *SelCond = SI->getCondition();
+      Value *TV = SI->getTrueValue();
+      Value *FV = SI->getFalseValue();
+
+      auto CondIt = KnownFacts.find(SelCond);
+      if (CondIt != KnownFacts.end()) {
+        Worklist.emplace_back(CondIt->second ? TV : FV, KnownVal);
+        continue;
+      }
+
+      bool TC, FC;
+      bool HasTC = getI1Constant(TV, TC);
+      bool HasFC = getI1Constant(FV, FC);
+      if (KnownVal) {
+        if (HasTC && !TC) {
+          Worklist.emplace_back(SelCond, false);
+          Worklist.emplace_back(FV, true);
+        } else if (HasFC && !FC) {
+          Worklist.emplace_back(SelCond, true);
+          Worklist.emplace_back(TV, true);
+        }
+      } else {
+        if (HasTC && TC) {
+          Worklist.emplace_back(SelCond, false);
+          Worklist.emplace_back(FV, false);
+        } else if (HasFC && FC) {
+          Worklist.emplace_back(SelCond, true);
+          Worklist.emplace_back(TV, false);
+        }
+      }
+    }
+  }
+
+  auto It = KnownFacts.find(Query);
+  if (It == KnownFacts.end())
+    return false;
+
+  KnownQuery = It->second;
+  return true;
+}
+
 Instruction *InstCombinerImpl::visitStoreInst(StoreInst &SI) {
   Value *Val = SI.getOperand(0);
   Value *Ptr = SI.getOperand(1);
@@ -1380,6 +1515,17 @@ Instruction *InstCombinerImpl::visitStoreInst(StoreInst &SI) {
   // Don't hack volatile/ordered stores.
   // FIXME: Some bits are legal for ordered atomic stores; needs refactoring.
   if (!SI.isUnordered()) return nullptr;
+
+  // If this block has a unique predecessor branch edge, try to infer whether
+  // the stored i1 value is constant on that edge.
+  if (Val->getType()->isIntegerTy(1)) {
+    bool KnownVal;
+    if (getKnownI1OnSinglePredEdge(SI.getParent(), Val, KnownVal)) {
+      return replaceOperand(
+          SI, 0,
+          ConstantInt::get(cast<IntegerType>(Val->getType()), KnownVal));
+    }
+  }
 
   // If the RHS is an alloca with a single use, zapify the store, making the
   // alloca dead.

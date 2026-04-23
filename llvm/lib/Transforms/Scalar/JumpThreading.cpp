@@ -955,6 +955,163 @@ static bool hasAddressTakenAndUsed(BasicBlock *BB) {
   return !BA->use_empty();
 }
 
+static bool getI1Constant(Value *V, bool &C) {
+  if (auto *CI = dyn_cast<ConstantInt>(V)) {
+    if (CI->getType()->isIntegerTy(1)) {
+      C = CI->isOne();
+      return true;
+    }
+  }
+  return false;
+}
+
+// If BB has a unique predecessor and control reaches BB through a
+// predecessor conditional branch edge, materialize i1 facts that are implied
+// on that edge for uses inside BB.
+static bool propagatePredBranchConditionIntoBlock(BasicBlock *BB,
+                                                  const TargetLibraryInfo *TLI) {
+  BasicBlock *Pred = BB->getSinglePredecessor();
+  if (!Pred || Pred == BB)
+    return false;
+
+  auto *PredBr = dyn_cast<BranchInst>(Pred->getTerminator());
+  if (!PredBr || !PredBr->isConditional())
+    return false;
+
+  if (PredBr->getSuccessor(0) == PredBr->getSuccessor(1))
+    return false;
+
+  bool CondVal;
+  if (PredBr->getSuccessor(0) == BB)
+    CondVal = true;
+  else if (PredBr->getSuccessor(1) == BB)
+    CondVal = false;
+  else
+    return false;
+
+  Value *Cond = PredBr->getCondition();
+  if (!Cond->getType()->isIntegerTy(1))
+    return false;
+
+  DenseMap<Value *, bool> KnownFacts;
+  SmallVector<std::pair<Value *, bool>, 16> Worklist;
+  Worklist.emplace_back(Cond, CondVal);
+
+  while (!Worklist.empty()) {
+    auto [V, KnownVal] = Worklist.pop_back_val();
+
+    auto It = KnownFacts.find(V);
+    if (It != KnownFacts.end()) {
+      if (It->second != KnownVal)
+        return false;
+      continue;
+    }
+    KnownFacts[V] = KnownVal;
+
+    auto *I = dyn_cast<Instruction>(V);
+    if (!I)
+      continue;
+
+    if (auto *FI = dyn_cast<FreezeInst>(I)) {
+      Worklist.emplace_back(FI->getOperand(0), KnownVal);
+      continue;
+    }
+
+    if (auto *BO = dyn_cast<BinaryOperator>(I)) {
+      if (!BO->getType()->isIntegerTy(1))
+        continue;
+
+      if (BO->getOpcode() == Instruction::Or && !KnownVal) {
+        Worklist.emplace_back(BO->getOperand(0), false);
+        Worklist.emplace_back(BO->getOperand(1), false);
+        continue;
+      }
+
+      if (BO->getOpcode() == Instruction::And && KnownVal) {
+        Worklist.emplace_back(BO->getOperand(0), true);
+        Worklist.emplace_back(BO->getOperand(1), true);
+        continue;
+      }
+
+      if (BO->getOpcode() == Instruction::Xor) {
+        bool C;
+        if (getI1Constant(BO->getOperand(1), C)) {
+          Worklist.emplace_back(BO->getOperand(0), KnownVal ^ C);
+          continue;
+        }
+        if (getI1Constant(BO->getOperand(0), C)) {
+          Worklist.emplace_back(BO->getOperand(1), KnownVal ^ C);
+          continue;
+        }
+      }
+    }
+
+    if (auto *SI = dyn_cast<SelectInst>(I)) {
+      if (!SI->getType()->isIntegerTy(1))
+        continue;
+
+      Value *SelCond = SI->getCondition();
+      Value *TV = SI->getTrueValue();
+      Value *FV = SI->getFalseValue();
+
+      auto CondIt = KnownFacts.find(SelCond);
+      if (CondIt != KnownFacts.end()) {
+        Worklist.emplace_back(CondIt->second ? TV : FV, KnownVal);
+        continue;
+      }
+
+      bool TC, FC;
+      bool HasTC = getI1Constant(TV, TC);
+      bool HasFC = getI1Constant(FV, FC);
+      if (KnownVal) {
+        if (HasTC && !TC) {
+          Worklist.emplace_back(SelCond, false);
+          Worklist.emplace_back(FV, true);
+        } else if (HasFC && !FC) {
+          Worklist.emplace_back(SelCond, true);
+          Worklist.emplace_back(TV, true);
+        }
+      } else {
+        if (HasTC && TC) {
+          Worklist.emplace_back(SelCond, false);
+          Worklist.emplace_back(FV, false);
+        } else if (HasFC && FC) {
+          Worklist.emplace_back(SelCond, true);
+          Worklist.emplace_back(TV, false);
+        }
+      }
+    }
+  }
+
+  bool Changed = false;
+  for (const auto &KV : KnownFacts) {
+    Value *KnownV = KV.first;
+    bool KnownB = KV.second;
+    if (!KnownV->getType()->isIntegerTy(1))
+      continue;
+
+    Constant *KnownC = ConstantInt::get(KnownV->getType(), KnownB);
+    SmallVector<Use *, 8> UsesToReplace;
+    for (Use &U : KnownV->uses()) {
+      auto *UserI = dyn_cast<Instruction>(U.getUser());
+      if (!UserI || UserI->getParent() != BB || isa<PHINode>(UserI))
+        continue;
+      UsesToReplace.push_back(&U);
+    }
+
+    for (Use *U : UsesToReplace) {
+      U->set(KnownC);
+      Changed = true;
+    }
+  }
+
+  if (!Changed)
+    return false;
+
+  SimplifyInstructionsInBlock(BB, TLI);
+  return true;
+}
+
 /// processBlock - If there are any predecessors whose control can be threaded
 /// through to a successor, transform them now.
 bool JumpThreadingPass::processBlock(BasicBlock *BB) {
@@ -969,6 +1126,9 @@ bool JumpThreadingPass::processBlock(BasicBlock *BB) {
   // because now the condition in this block can be threaded through
   // predecessors of our predecessor block.
   if (maybeMergeBasicBlockIntoOnlyPred(BB))
+    return true;
+
+  if (propagatePredBranchConditionIntoBlock(BB, TLI))
     return true;
 
   if (tryToUnfoldSelectInCurrBB(BB))
